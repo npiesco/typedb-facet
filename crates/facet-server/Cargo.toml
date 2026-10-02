@@ -16,13 +16,17 @@ path = "src/main.rs"
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+chrono.workspace = true
 clap.workspace = true
+datafusion.workspace = true
+datafusion-postgres.workspace = true
 facet-core.workspace = true
 facet-state.workspace = true
 facet-typedb.workspace = true
 futures.workspace = true
 pgwire.workspace = true
 rand.workspace = true
+rust_decimal.workspace = true
 rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true

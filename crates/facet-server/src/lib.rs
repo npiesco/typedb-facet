@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+mod engine;
+
 use std::{
     collections::HashMap,
     env,
@@ -23,8 +25,8 @@ use std::{
 use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
 use facet_core::{
-    Catalog, CoreError, ProjectionStatement, QueryError, QueryResult, ScalarType, SessionContext,
-    execute_sql, parse_projection_ddl,
+    Catalog, CoreError, ProjectionStatement, QueryResult, ScalarType, SessionContext,
+    parse_projection_ddl,
 };
 use facet_state::{PersistedProjection, StateStore};
 use facet_typedb::{TypeDbClient, TypeDbLimits};
@@ -301,6 +303,7 @@ pub async fn serve(config: Config) -> Result<(), ServerError> {
     let listener = TcpListener::bind(config.postgres.listen).await?;
     let address = listener.local_addr()?;
     let handler = Arc::new(QueryHandler {
+        engine: engine::Engine::new(catalog.clone()),
         catalog,
         typedb,
         state,
@@ -575,6 +578,7 @@ struct QueryHandler {
     state: StateStore,
     ddl_locks: DdlLocks,
     server_port: u16,
+    engine: engine::Engine,
 }
 
 type ProjectionKey = (String, String);
@@ -626,10 +630,7 @@ impl SimpleQueryHandler for QueryHandler {
                 .unwrap_or_else(|| "facet".to_owned()),
             server_port: self.server_port,
         };
-        Ok(vec![match execute_sql(&self.catalog, trimmed, &session) {
-            Ok(result) => encode_query_result(result)?,
-            Err(error) => query_error_response(error),
-        }])
+        self.engine.execute(trimmed, &session).await
     }
 }
 
@@ -805,10 +806,6 @@ fn postgres_type(scalar_type: ScalarType) -> Type {
         ScalarType::Duration => Type::INTERVAL,
         ScalarType::String => Type::TEXT,
     }
-}
-
-fn query_error_response(error: QueryError) -> Response {
-    error_response(error.code, error.message)
 }
 
 fn error_response(code: &'static str, message: String) -> Response {

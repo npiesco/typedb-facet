@@ -1218,6 +1218,16 @@ pub fn psql_binary() -> OsString {
     env::var_os("FACET_E2E_PSQL").unwrap_or_else(|| OsString::from("psql.exe"))
 }
 
+/// A Python interpreter that can `import duckdb`.
+pub fn python_binary() -> TestResult<PathBuf> {
+    Ok(PathBuf::from(required_env("FACET_E2E_PYTHON")?))
+}
+
+/// The `dbt` executable with the dbt-postgres adapter installed.
+pub fn dbt_binary() -> TestResult<PathBuf> {
+    Ok(PathBuf::from(required_env("FACET_E2E_DBT")?))
+}
+
 async fn run_typeql(
     client: &Client,
     origin: &str,

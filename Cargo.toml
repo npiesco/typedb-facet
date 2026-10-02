@@ -20,6 +20,8 @@ bytes = "1.12.1"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 chrono-tz = "0.10.4"
 clap = { version = "4.6.0", features = ["derive"] }
+datafusion = "54"
+datafusion-postgres = "0.18.0"
 facet-core = { path = "crates/facet-core" }
 facet-state = { path = "crates/facet-state" }
 facet-typedb = { path = "crates/facet-typedb" }

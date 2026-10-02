@@ -533,6 +533,19 @@ impl Catalog {
             .is_some()
     }
 
+    pub fn names(&self, database: &str) -> Vec<String> {
+        let mut names = self
+            .projections
+            .read()
+            .expect("catalog read lock")
+            .iter()
+            .filter(|((owner, _), _)| owner == database)
+            .map(|(_, projection)| projection.definition.name().to_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
     pub fn projection(&self, database: &str, name: &str) -> Option<Projection> {
         self.projections
             .read()
@@ -601,6 +614,13 @@ fn execute_query(
     query: sqlparser::ast::Query,
     session: &SessionContext,
 ) -> Result<QueryResult, QueryError> {
+    if query.with.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+    {
+        return Err(unsupported("query modifiers"));
+    }
     let order_by = match query.order_by {
         None => Vec::new(),
         Some(order_by) => match order_by.kind {
@@ -638,7 +658,26 @@ fn execute_query(
         }
     };
 
+    let grouped = !matches!(
+        &select.group_by,
+        sqlparser::ast::GroupByExpr::Expressions(expressions, modifiers)
+            if expressions.is_empty() && modifiers.is_empty()
+    );
+    if select.selection.is_some()
+        || grouped
+        || select.having.is_some()
+        || select.distinct.is_some()
+        || select.top.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.qualify.is_some()
+    {
+        return Err(unsupported("SELECT clauses"));
+    }
     if select.from.is_empty() {
+        if !order_by.is_empty() {
+            return Err(unsupported("ORDER BY without FROM"));
+        }
         return execute_expressions(&select.projection, session);
     }
     if select.from.len() != 1 || !select.from[0].joins.is_empty() {
@@ -649,19 +688,30 @@ fn execute_query(
     }
 
     let table = match &select.from[0].relation {
-        TableFactor::Table { name, .. } => name
-            .0
-            .last()
-            .and_then(|part| match part {
-                ObjectNamePart::Identifier(identifier) => {
-                    Some(identifier.value.to_ascii_lowercase())
+        TableFactor::Table {
+            name, args: None, ..
+        } => {
+            let parts = name
+                .0
+                .iter()
+                .map(|part| match part {
+                    ObjectNamePart::Identifier(identifier) => Ok(identifier.value.clone()),
+                    _ => Err(unsupported("projection name")),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            match parts.as_slice() {
+                [table] => table.to_ascii_lowercase(),
+                [schema, table] if schema.eq_ignore_ascii_case("public") => {
+                    table.to_ascii_lowercase()
                 }
-                _ => None,
-            })
-            .ok_or_else(|| QueryError {
-                code: "42601",
-                message: "invalid projection name".to_owned(),
-            })?,
+                [database, schema, table]
+                    if database == &session.database && schema.eq_ignore_ascii_case("public") =>
+                {
+                    table.to_ascii_lowercase()
+                }
+                _ => return Err(unsupported("qualified relation")),
+            }
+        }
         other => {
             return Err(QueryError {
                 code: "0A000",
@@ -793,7 +843,7 @@ fn execute_expressions(
             }
         };
 
-        let (default_name, value) = evaluate_expression(expression, session);
+        let (default_name, value) = evaluate_expression(expression, session)?;
         columns.push(ResultColumn {
             name: alias.unwrap_or(default_name),
             scalar_type: ScalarType::String,
@@ -806,10 +856,20 @@ fn execute_expressions(
     })
 }
 
-fn evaluate_expression(expression: &Expr, session: &SessionContext) -> (String, Option<String>) {
+fn unsupported(what: &str) -> QueryError {
+    QueryError {
+        code: "0A000",
+        message: format!("unsupported {what}"),
+    }
+}
+
+fn evaluate_expression(
+    expression: &Expr,
+    session: &SessionContext,
+) -> Result<(String, Option<String>), QueryError> {
     let rendered = expression.to_string();
     let lower = rendered.to_ascii_lowercase();
-    match lower.as_str() {
+    Ok(match lower.as_str() {
         "current_database()" => (
             "current_database".to_owned(),
             Some(session.database.clone()),
@@ -822,7 +882,7 @@ fn evaluate_expression(expression: &Expr, session: &SessionContext) -> (String, 
         }
         "version()" => (
             "version".to_owned(),
-            Some("Facet PostgreSQL-compatible TypeDB sidecar".to_owned()),
+            Some("PostgreSQL 16.13 (Facet PostgreSQL-compatible TypeDB sidecar)".to_owned()),
         ),
         "inet_server_addr()" => ("inet_server_addr".to_owned(), None),
         "inet_server_port()" => (
@@ -834,11 +894,11 @@ fn evaluate_expression(expression: &Expr, session: &SessionContext) -> (String, 
                 Value::SingleQuotedString(value) => (rendered, Some(value.clone())),
                 Value::Number(value, _) => (rendered, Some(value.clone())),
                 Value::Null => (rendered, None),
-                _ => (rendered.clone(), Some(rendered)),
+                _ => return Err(unsupported("literal")),
             },
-            _ => (rendered.clone(), Some(rendered)),
+            _ => return Err(unsupported("expression")),
         },
-    }
+    })
 }
 
 fn compare_cells(left: Option<&Cell>, right: Option<&Cell>) -> Ordering {
