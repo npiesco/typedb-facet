@@ -27,7 +27,7 @@ use facet_core::{
     execute_sql, parse_projection_ddl,
 };
 use facet_state::{PersistedProjection, StateStore};
-use facet_typedb::TypeDbClient;
+use facet_typedb::{TypeDbClient, TypeDbLimits};
 use futures::{Sink, stream};
 use pgwire::{
     api::{
@@ -53,7 +53,10 @@ use pgwire::{
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::{net::TcpListener, sync::Mutex as AsyncMutex};
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex as AsyncMutex, Semaphore},
+};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -62,6 +65,49 @@ pub struct Config {
     state: StateConfig,
     #[serde(default)]
     refresh: Option<RefreshConfig>,
+    #[serde(default)]
+    limits: LimitsConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitsConfig {
+    max_rows: Option<u64>,
+    max_response_bytes: Option<u64>,
+    max_connections: Option<u64>,
+}
+
+const DEFAULT_MAX_CONNECTIONS: u64 = 100;
+
+impl LimitsConfig {
+    fn validate(&self) -> Result<(), ServerError> {
+        for (key, value) in [
+            ("max_rows", self.max_rows),
+            ("max_response_bytes", self.max_response_bytes),
+            ("max_connections", self.max_connections),
+        ] {
+            if value == Some(0) {
+                return Err(ServerError::ZeroLimit(key));
+            }
+        }
+        Ok(())
+    }
+
+    fn typedb(&self) -> TypeDbLimits {
+        let defaults = TypeDbLimits::default();
+        TypeDbLimits {
+            max_rows: self.max_rows.unwrap_or(defaults.max_rows),
+            max_response_bytes: self
+                .max_response_bytes
+                .unwrap_or(defaults.max_response_bytes),
+        }
+    }
+
+    fn max_connections(&self) -> usize {
+        usize::try_from(self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS))
+            .unwrap_or(usize::MAX)
+            .min(tokio::sync::Semaphore::MAX_PERMITS)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -173,6 +219,8 @@ pub enum ServerError {
     State(#[from] facet_state::StateError),
     #[error("invalid refresh interval {0:?}; expected a positive integer with ms, s or m")]
     InvalidRefreshInterval(String),
+    #[error("invalid [limits] {0} = 0; expected a positive integer")]
+    ZeroLimit(&'static str),
 }
 
 impl Config {
@@ -183,6 +231,7 @@ impl Config {
             return Err(ServerError::TlsRequired(config.postgres.listen));
         }
         config.refresh_interval()?;
+        config.limits.validate()?;
         Ok(config)
     }
 
@@ -204,7 +253,9 @@ pub async fn serve(config: Config) -> Result<(), ServerError> {
         .as_ref()
         .map(TlsConfig::acceptor)
         .transpose()?;
-    let typedb = TypeDbClient::new(config.typedb.url, config.typedb.username, typedb_password)?;
+    let typedb = TypeDbClient::new(config.typedb.url, config.typedb.username, typedb_password)?
+        .with_limits(config.limits.typedb());
+    let connections = Arc::new(Semaphore::new(config.limits.max_connections()));
     let state = StateStore::open(config.state.path)?;
     let catalog = Catalog::default();
     for persisted in state.load_all()? {
@@ -227,11 +278,7 @@ pub async fn serve(config: Config) -> Result<(), ServerError> {
         refresh_interval,
     ));
     let auth = Arc::new(FacetAuth::new(config.postgres.username, postgres_password));
-    let handlers = Arc::new(Handlers {
-        handler,
-        auth,
-        require_tls: tls_acceptor.is_some(),
-    });
+    let require_tls = tls_acceptor.is_some();
 
     println!(
         "{}",
@@ -244,12 +291,21 @@ pub async fn serve(config: Config) -> Result<(), ServerError> {
 
     loop {
         let (socket, _) = listener.accept().await?;
-        let handlers = Arc::clone(&handlers);
+        // The permit lives exactly as long as the connection task, so a client that
+        // disconnects (cleanly or not) frees its slot when process_socket returns.
+        let permit = Arc::clone(&connections).try_acquire_owned().ok();
+        let handlers = Arc::new(Handlers {
+            handler: Arc::clone(&handler),
+            auth: Arc::clone(&auth),
+            require_tls,
+            over_connection_limit: permit.is_none(),
+        });
         let tls_acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
             if let Err(error) = process_socket(socket, tls_acceptor, handlers).await {
                 eprintln!("Facet pgwire connection failed: {error}");
             }
+            drop(permit);
         });
     }
 }
@@ -307,6 +363,7 @@ struct Handlers {
     handler: Arc<QueryHandler>,
     auth: Arc<FacetAuth>,
     require_tls: bool,
+    over_connection_limit: bool,
 }
 
 /// Refuses any startup that did not negotiate TLS when the listener has TLS
@@ -315,6 +372,7 @@ struct Handlers {
 struct RequireTls<H> {
     inner: H,
     required: bool,
+    over_connection_limit: bool,
 }
 
 #[async_trait]
@@ -329,6 +387,13 @@ impl<H: StartupHandler> StartupHandler for RequireTls<H> {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if self.over_connection_limit {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_owned(),
+                "53300".to_owned(),
+                "sorry, too many clients already".to_owned(),
+            ))));
+        }
         if self.required && !client.is_secure() {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "FATAL".to_owned(),
@@ -367,6 +432,7 @@ impl PgWireServerHandlers for Handlers {
         Arc::new(RequireTls {
             inner: SASLAuthStartupHandler::new(Arc::new(parameters)).with_scram(scram),
             required: self.require_tls,
+            over_connection_limit: self.over_connection_limit,
         })
     }
 }

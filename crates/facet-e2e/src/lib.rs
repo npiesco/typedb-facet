@@ -389,6 +389,34 @@ pub struct FacetOptions {
     pub listen: String,
     pub refresh_interval: String,
     pub tls: Option<(PathBuf, PathBuf)>,
+    pub limits: FacetLimits,
+}
+
+/// Values written to the optional `[limits]` section; `None` omits the key so
+/// Facet applies its default.
+#[derive(Clone, Debug, Default)]
+pub struct FacetLimits {
+    pub max_rows: Option<u64>,
+    pub max_response_bytes: Option<u64>,
+    pub max_connections: Option<u64>,
+}
+
+impl FacetLimits {
+    fn toml(&self) -> String {
+        let entries: Vec<String> = [
+            ("max_rows", self.max_rows),
+            ("max_response_bytes", self.max_response_bytes),
+            ("max_connections", self.max_connections),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| format!("{key} = {value}\n")))
+        .collect();
+        if entries.is_empty() {
+            String::new()
+        } else {
+            format!("\n[limits]\n{}", entries.concat())
+        }
+    }
 }
 
 impl Default for FacetOptions {
@@ -397,6 +425,7 @@ impl Default for FacetOptions {
             listen: "127.0.0.1:0".to_owned(),
             refresh_interval: "5s".to_owned(),
             tls: None,
+            limits: FacetLimits::default(),
         }
     }
 }
@@ -448,7 +477,7 @@ impl TlsMaterial {
 
 pub struct FacetProcess {
     child: Child,
-    _stderr: Arc<Mutex<String>>,
+    stderr: Arc<Mutex<String>>,
     postgres_address: SocketAddr,
 }
 
@@ -484,6 +513,7 @@ impl FacetProcess {
         let state_path = toml_string(&workspace.join("facet-state.sqlite3"));
         let listen = &options.listen;
         let refresh_interval = &options.refresh_interval;
+        let limits = options.limits.toml();
         let tls = options
             .tls
             .as_ref()
@@ -511,7 +541,7 @@ path = "{state_path}"
 
 [refresh]
 interval = "{refresh_interval}"
-"#
+{limits}"#
         );
         std::fs::write(&config_path, config)?;
 
@@ -541,11 +571,11 @@ interval = "{refresh_interval}"
         let stderr_thread_capture = Arc::clone(&stderr_capture);
 
         let mut stderr_reader = Some(thread::spawn(move || {
-            let mut stderr = BufReader::new(stderr);
-            let mut captured = String::new();
-            let _ = stderr.read_to_string(&mut captured);
-            if let Ok(mut destination) = stderr_thread_capture.lock() {
-                *destination = captured;
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Ok(mut destination) = stderr_thread_capture.lock() {
+                    destination.push_str(&line);
+                    destination.push('\n');
+                }
             }
         }));
 
@@ -592,13 +622,21 @@ interval = "{refresh_interval}"
 
         Ok(Self {
             child: child.disarm(),
-            _stderr: stderr_capture,
+            stderr: stderr_capture,
             postgres_address,
         })
     }
 
     pub fn postgres_address(&self) -> SocketAddr {
         self.postgres_address
+    }
+
+    /// Everything Facet has written to stderr so far.
+    pub fn stderr(&self) -> String {
+        self.stderr
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default()
     }
 
     pub fn target(&self) -> PgTarget {
@@ -1035,6 +1073,114 @@ pub fn run_psql_env(
         command.env(name, value);
     }
     Ok(command.output()?)
+}
+
+/// An interactive psql session that keeps one PostgreSQL connection open until
+/// it is dropped or explicitly closed.
+pub struct HeldPsql {
+    child: Option<Child>,
+    stdin: Option<std::process::ChildStdin>,
+    lines: mpsc::Receiver<String>,
+    stderr: Arc<Mutex<String>>,
+}
+
+impl HeldPsql {
+    /// Starts psql; callers prove the connection with [`HeldPsql::query_one`].
+    pub fn open(psql: &OsStr, target: &PgTarget) -> TestResult<Self> {
+        let mut child = Command::new(psql)
+            .arg("--no-psqlrc")
+            .arg("--host")
+            .arg(target.address.ip().to_string())
+            .arg("--port")
+            .arg(target.address.port().to_string())
+            .arg("--username")
+            .arg(&target.user)
+            .arg("--dbname")
+            .arg(&target.database)
+            .arg("--no-align")
+            .arg("--tuples-only")
+            .arg("--quiet")
+            .env("PGPASSWORD", &target.password)
+            .env("PGSSLMODE", "disable")
+            .env("PGCONNECT_TIMEOUT", "5")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdin = child.stdin.take().ok_or("psql stdin was not piped")?;
+        let stdout = child.stdout.take().ok_or("psql stdout was not piped")?;
+        let stderr = child.stderr.take().ok_or("psql stderr was not piped")?;
+        let (line_tx, lines) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line_tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let stderr_capture = Arc::new(Mutex::new(String::new()));
+        let stderr_thread_capture = Arc::clone(&stderr_capture);
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Ok(mut destination) = stderr_thread_capture.lock() {
+                    destination.push_str(&line);
+                    destination.push('\n');
+                }
+            }
+        });
+        Ok(Self {
+            child: Some(child),
+            stdin: Some(stdin),
+            lines,
+            stderr: stderr_capture,
+        })
+    }
+
+    /// Sends `sql` and waits for psql to print `expected` on its own line.
+    pub fn query_one(&mut self, sql: &str, expected: &str) -> TestResult<()> {
+        let stdin = self.stdin.as_mut().ok_or("held psql was already closed")?;
+        writeln!(stdin, "{sql}")?;
+        stdin.flush()?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(remaining) {
+                Ok(line) if line.trim() == expected => return Ok(()),
+                Ok(_) => continue,
+                Err(_) => {
+                    let stderr = self
+                        .stderr
+                        .lock()
+                        .map(|value| value.clone())
+                        .unwrap_or_default();
+                    return Err(format!(
+                        "held psql did not print {expected:?} for {sql:?}; stderr: {stderr}"
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+
+    /// Kills psql without a protocol Terminate, as a crashed client would.
+    pub fn kill(mut self) -> TestResult<()> {
+        self.stdin = None;
+        if let Some(mut child) = self.child.take() {
+            child.kill()?;
+            child.wait()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HeldPsql {
+    fn drop(&mut self) {
+        self.stdin = None;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 pub fn assert_psql_success(output: &Output, operation: &str) {

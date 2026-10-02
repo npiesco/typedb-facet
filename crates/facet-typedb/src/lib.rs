@@ -26,6 +26,23 @@ pub struct TypeDbClient {
     username: String,
     password: String,
     token: Arc<Mutex<Option<String>>>,
+    limits: TypeDbLimits,
+}
+
+/// Per-projection resource bounds applied to every TypeDB answer Facet materializes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TypeDbLimits {
+    pub max_rows: u64,
+    pub max_response_bytes: u64,
+}
+
+impl Default for TypeDbLimits {
+    fn default() -> Self {
+        Self {
+            max_rows: 1_000_000,
+            max_response_bytes: 256 * 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -36,6 +53,12 @@ pub enum TypeDbError {
     Response { status: StatusCode, body: String },
     #[error("TypeDB response was invalid: {0}")]
     InvalidResponse(String),
+    #[error("projection {name:?} exceeded [limits] max_rows = {limit}")]
+    RowLimit { name: String, limit: u64 },
+    #[error(
+        "TypeDB response for projection {name:?} exceeded [limits] max_response_bytes = {limit}"
+    )]
+    ResponseByteLimit { name: String, limit: u64 },
     #[error("{message}")]
     Unrepresentable {
         sqlstate: &'static str,
@@ -47,6 +70,7 @@ impl TypeDbError {
     pub fn sqlstate(&self) -> &'static str {
         match self {
             Self::Unrepresentable { sqlstate, .. } => sqlstate,
+            Self::RowLimit { .. } | Self::ResponseByteLimit { .. } => "54000",
             Self::Http(_) | Self::Response { .. } | Self::InvalidResponse(_) => "XX000",
         }
     }
@@ -62,7 +86,13 @@ impl TypeDbClient {
             username,
             password,
             token: Arc::new(Mutex::new(None)),
+            limits: TypeDbLimits::default(),
         })
+    }
+
+    pub fn with_limits(mut self, limits: TypeDbLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     pub async fn materialize(
@@ -76,17 +106,28 @@ impl TypeDbClient {
             "query": definition.source_query(),
             "queryOptions": {
                 "includeInstanceTypes": false,
-                "includeQueryStructure": false
+                "includeQueryStructure": false,
+                // TypeDB silently truncates at its own default (10,000) and answers 206;
+                // asking for one more than the cap lets Facet detect overflow exactly.
+                "answerCountLimit": self.limits.max_rows.saturating_add(1)
             },
             "commit": false
         });
         let token = self.current_token().await?;
-        let (mut status, mut body) = self.post_query(&token, &request).await?;
+        let name = definition.name();
+        let (mut status, mut body) = self.post_query(name, &token, &request).await?;
         if status == StatusCode::UNAUTHORIZED {
             // TypeDB tokens expire server-side; an expired token is answered with 401
             // and the session must authenticate again before resending the request.
             let token = self.replace_token(&token).await?;
-            (status, body) = self.post_query(&token, &request).await?;
+            (status, body) = self.post_query(name, &token, &request).await?;
+        }
+        let row_limit = || TypeDbError::RowLimit {
+            name: name.to_owned(),
+            limit: self.limits.max_rows,
+        };
+        if status == StatusCode::PARTIAL_CONTENT {
+            return Err(row_limit());
         }
         if !status.is_success() {
             return Err(TypeDbError::Response { status, body });
@@ -98,6 +139,9 @@ impl TypeDbClient {
             .get("answers")
             .and_then(Value::as_array)
             .ok_or_else(|| TypeDbError::InvalidResponse("missing answers array".to_owned()))?;
+        if u64::try_from(answers.len()).map_or(true, |count| count > self.limits.max_rows) {
+            return Err(row_limit());
+        }
 
         answers
             .iter()
@@ -113,10 +157,11 @@ impl TypeDbClient {
 
     async fn post_query(
         &self,
+        name: &str,
         token: &str,
         request: &Value,
     ) -> Result<(StatusCode, String), TypeDbError> {
-        let response = self
+        let mut response = self
             .http
             .post(format!("{}/v1/query", self.origin))
             .bearer_auth(token)
@@ -124,7 +169,26 @@ impl TypeDbClient {
             .send()
             .await?;
         let status = response.status();
-        let body = response.text().await?;
+        let limit = self.limits.max_response_bytes;
+        let exceeded = || TypeDbError::ResponseByteLimit {
+            name: name.to_owned(),
+            limit,
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit)
+        {
+            return Err(exceeded());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if u64::try_from(bytes.len() + chunk.len()).map_or(true, |total| total > limit) {
+                return Err(exceeded());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8(bytes)
+            .map_err(|error| TypeDbError::InvalidResponse(error.to_string()))?;
         Ok((status, body))
     }
 
