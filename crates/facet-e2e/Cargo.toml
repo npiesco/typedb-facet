@@ -13,3 +13,6 @@ reqwest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tokio-postgres = "0.7.18"

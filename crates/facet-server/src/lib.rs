@@ -28,10 +28,11 @@ use facet_core::{
 };
 use facet_state::{PersistedProjection, StateStore};
 use facet_typedb::{TypeDbClient, TypeDbLimits};
-use futures::{Sink, stream};
+use futures::{Sink, SinkExt, StreamExt, stream};
 use pgwire::{
     api::{
-        ClientInfo, ClientPortalStore, PgWireServerHandlers, Type,
+        ClientInfo, ClientPortalStore, ErrorHandler, PgWireConnectionState, PgWireServerHandlers,
+        Type,
         auth::{
             AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler,
             sasl::{
@@ -46,7 +47,8 @@ use pgwire::{
     error::{ErrorInfo, PgWireError, PgWireResult},
     messages::{PgWireBackendMessage, PgWireFrontendMessage, data::DataRow},
     tokio::{
-        TlsAcceptor, process_socket,
+        TlsAcceptor,
+        server::{negotiate_tls, process_error, process_message},
         tokio_rustls::rustls::{ServerConfig, crypto::ring::default_provider},
     },
 };
@@ -54,7 +56,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::{Mutex as AsyncMutex, Semaphore},
 };
 
@@ -75,9 +77,18 @@ struct LimitsConfig {
     max_rows: Option<u64>,
     max_response_bytes: Option<u64>,
     max_connections: Option<u64>,
+    authentication_timeout: Option<String>,
+    idle_session_timeout: Option<String>,
 }
 
 const DEFAULT_MAX_CONNECTIONS: u64 = 100;
+const DEFAULT_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug)]
+struct Lifecycle {
+    authentication_timeout: Duration,
+    idle_session_timeout: Option<Duration>,
+}
 
 impl LimitsConfig {
     fn validate(&self) -> Result<(), ServerError> {
@@ -90,7 +101,30 @@ impl LimitsConfig {
                 return Err(ServerError::ZeroLimit(key));
             }
         }
+        self.lifecycle()?;
         Ok(())
+    }
+
+    fn lifecycle(&self) -> Result<Lifecycle, ServerError> {
+        let timeout = |key: &'static str, value: &Option<String>| {
+            value
+                .as_deref()
+                .map(|value| {
+                    parse_interval(value).ok_or_else(|| ServerError::InvalidTimeout {
+                        key,
+                        value: value.to_owned(),
+                    })
+                })
+                .transpose()
+        };
+        Ok(Lifecycle {
+            authentication_timeout: timeout(
+                "authentication_timeout",
+                &self.authentication_timeout,
+            )?
+            .unwrap_or(DEFAULT_AUTHENTICATION_TIMEOUT),
+            idle_session_timeout: timeout("idle_session_timeout", &self.idle_session_timeout)?,
+        })
     }
 
     fn typedb(&self) -> TypeDbLimits {
@@ -175,24 +209,18 @@ struct RefreshConfig {
 
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
-fn parse_interval(input: &str) -> Result<Duration, ServerError> {
-    let invalid = || ServerError::InvalidRefreshInterval(input.to_owned());
+fn parse_interval(input: &str) -> Option<Duration> {
     let trimmed = input.trim();
-    let split = trimmed
-        .find(|character: char| !character.is_ascii_digit())
-        .ok_or_else(invalid)?;
+    let split = trimmed.find(|character: char| !character.is_ascii_digit())?;
     let (number, unit) = trimmed.split_at(split);
-    let number: u64 = number.parse().map_err(|_| invalid())?;
+    let number: u64 = number.parse().ok()?;
     let interval = match unit {
         "ms" => Duration::from_millis(number),
         "s" => Duration::from_secs(number),
-        "m" => Duration::from_secs(number.checked_mul(60).ok_or_else(invalid)?),
-        _ => return Err(invalid()),
+        "m" => Duration::from_secs(number.checked_mul(60)?),
+        _ => return None,
     };
-    if interval.is_zero() {
-        return Err(invalid());
-    }
-    Ok(interval)
+    (!interval.is_zero()).then_some(interval)
 }
 
 #[derive(Debug, Error)]
@@ -221,6 +249,8 @@ pub enum ServerError {
     InvalidRefreshInterval(String),
     #[error("invalid [limits] {0} = 0; expected a positive integer")]
     ZeroLimit(&'static str),
+    #[error("invalid [limits] {key} {value:?}; expected a positive integer with ms, s or m")]
+    InvalidTimeout { key: &'static str, value: String },
 }
 
 impl Config {
@@ -239,7 +269,10 @@ impl Config {
         self.refresh
             .as_ref()
             .and_then(|refresh| refresh.interval.as_deref())
-            .map_or(Ok(DEFAULT_REFRESH_INTERVAL), parse_interval)
+            .map_or(Ok(DEFAULT_REFRESH_INTERVAL), |interval| {
+                parse_interval(interval)
+                    .ok_or_else(|| ServerError::InvalidRefreshInterval(interval.to_owned()))
+            })
     }
 }
 
@@ -256,6 +289,7 @@ pub async fn serve(config: Config) -> Result<(), ServerError> {
     let typedb = TypeDbClient::new(config.typedb.url, config.typedb.username, typedb_password)?
         .with_limits(config.limits.typedb());
     let connections = Arc::new(Semaphore::new(config.limits.max_connections()));
+    let lifecycle = config.limits.lifecycle()?;
     let state = StateStore::open(config.state.path)?;
     let catalog = Catalog::default();
     for persisted in state.load_all()? {
@@ -292,7 +326,7 @@ pub async fn serve(config: Config) -> Result<(), ServerError> {
     loop {
         let (socket, _) = listener.accept().await?;
         // The permit lives exactly as long as the connection task, so a client that
-        // disconnects (cleanly or not) frees its slot when process_socket returns.
+        // disconnects, times out or crashes frees its slot when serve_connection returns.
         let permit = Arc::clone(&connections).try_acquire_owned().ok();
         let handlers = Arc::new(Handlers {
             handler: Arc::clone(&handler),
@@ -302,12 +336,110 @@ pub async fn serve(config: Config) -> Result<(), ServerError> {
         });
         let tls_acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
-            if let Err(error) = process_socket(socket, tls_acceptor, handlers).await {
+            if let Err(error) = serve_connection(socket, tls_acceptor, handlers, lifecycle).await {
                 eprintln!("Facet pgwire connection failed: {error}");
             }
             drop(permit);
         });
     }
+}
+
+/// One client connection. Ported from pgwire 0.40.7 `tokio::server::process_socket`
+/// and its `process_socket_messages!` loop (src/tokio/server.rs:548-602, 632-662),
+/// whose 60s startup timeout is hard-coded and which has no idle timeout. Facet
+/// keeps that loop message-for-message and adds PostgreSQL's
+/// `authentication_timeout` and `idle_session_timeout` semantics.
+async fn serve_connection(
+    tcp_socket: TcpStream,
+    tls_acceptor: Option<TlsAcceptor>,
+    handlers: Arc<Handlers>,
+    lifecycle: Lifecycle,
+) -> io::Result<()> {
+    let startup_handler = handlers.startup_handler();
+    let simple_query_handler = handlers.simple_query_handler();
+    let extended_query_handler = handlers.extended_query_handler();
+    let copy_handler = handlers.copy_handler();
+    let cancel_handler = handlers.cancel_handler();
+    let error_handler = handlers.error_handler();
+
+    let authentication_deadline = tokio::time::sleep(lifecycle.authentication_timeout);
+    tokio::pin!(authentication_deadline);
+    let socket = tokio::select! {
+        _ = &mut authentication_deadline => return Ok(()),
+        socket = negotiate_tls(tcp_socket, tls_acceptor) => socket?,
+    };
+    // A direct-TLS client on a listener without TLS is not a PostgreSQL session.
+    let Some(mut socket) = socket else {
+        return Ok(());
+    };
+
+    loop {
+        let message = match socket.state() {
+            PgWireConnectionState::AwaitingStartup => tokio::select! {
+                _ = &mut authentication_deadline => return Ok(()),
+                message = socket.next() => message,
+            },
+            PgWireConnectionState::AuthenticationInProgress => tokio::select! {
+                _ = &mut authentication_deadline => {
+                    return send_fatal(&mut socket, "57014", "canceling authentication due to timeout").await;
+                }
+                message = socket.next() => message,
+            },
+            _ => match lifecycle.idle_session_timeout {
+                Some(idle) => match tokio::time::timeout(idle, socket.next()).await {
+                    Ok(message) => message,
+                    Err(_) => {
+                        return send_fatal(
+                            &mut socket,
+                            "57P05",
+                            "terminating connection due to idle-session timeout",
+                        )
+                        .await;
+                    }
+                },
+                None => socket.next().await,
+            },
+        };
+        let Some(Ok(message)) = message else {
+            return Ok(());
+        };
+        // Terminate means the client is leaving; drop the socket so clients that
+        // wait for the server to close (asyncpg) are not deadlocked.
+        if matches!(message, PgWireFrontendMessage::Terminate(_)) {
+            return Ok(());
+        }
+        let is_extended_query = match socket.state() {
+            PgWireConnectionState::CopyInProgress(is_extended_query) => is_extended_query,
+            _ => message.is_extended_query(),
+        };
+        if let Err(mut error) = process_message(
+            message,
+            &mut socket,
+            startup_handler.clone(),
+            simple_query_handler.clone(),
+            extended_query_handler.clone(),
+            copy_handler.clone(),
+            cancel_handler.clone(),
+        )
+        .await
+        {
+            error_handler.on_error(&socket, &mut error);
+            process_error(&mut socket, error, is_extended_query).await?;
+        }
+    }
+}
+
+/// Sends a FATAL ErrorResponse and closes, as a PostgreSQL backend does when it
+/// terminates a session on its own initiative (no ReadyForQuery follows).
+async fn send_fatal<S>(socket: &mut S, code: &str, message: &str) -> io::Result<()>
+where
+    S: Sink<PgWireBackendMessage, Error = io::Error> + Unpin,
+{
+    let error = ErrorInfo::new("FATAL".to_owned(), code.to_owned(), message.to_owned());
+    socket
+        .send(PgWireBackendMessage::ErrorResponse(error.into()))
+        .await?;
+    socket.close().await
 }
 
 fn read_secret(name: &str) -> Result<String, ServerError> {

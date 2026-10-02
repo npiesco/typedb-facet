@@ -399,11 +399,13 @@ pub struct FacetLimits {
     pub max_rows: Option<u64>,
     pub max_response_bytes: Option<u64>,
     pub max_connections: Option<u64>,
+    pub authentication_timeout: Option<String>,
+    pub idle_session_timeout: Option<String>,
 }
 
 impl FacetLimits {
     fn toml(&self) -> String {
-        let entries: Vec<String> = [
+        let mut entries: Vec<String> = [
             ("max_rows", self.max_rows),
             ("max_response_bytes", self.max_response_bytes),
             ("max_connections", self.max_connections),
@@ -411,6 +413,14 @@ impl FacetLimits {
         .into_iter()
         .filter_map(|(key, value)| value.map(|value| format!("{key} = {value}\n")))
         .collect();
+        entries.extend(
+            [
+                ("authentication_timeout", &self.authentication_timeout),
+                ("idle_session_timeout", &self.idle_session_timeout),
+            ]
+            .into_iter()
+            .filter_map(|(key, value)| value.as_ref().map(|value| format!("{key} = {value:?}\n"))),
+        );
         if entries.is_empty() {
             String::new()
         } else {
@@ -1160,6 +1170,14 @@ impl HeldPsql {
                 }
             }
         }
+    }
+
+    /// Everything psql has written to stderr so far.
+    pub fn stderr(&self) -> String {
+        self.stderr
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default()
     }
 
     /// Kills psql without a protocol Terminate, as a crashed client would.
