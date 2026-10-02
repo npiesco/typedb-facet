@@ -1,0 +1,30 @@
+[package]
+name = "facet-server"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "facet"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+clap.workspace = true
+facet-core.workspace = true
+facet-state.workspace = true
+facet-typedb.workspace = true
+futures.workspace = true
+pgwire.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
