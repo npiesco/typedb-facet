@@ -42,8 +42,10 @@ use pgwire::{
                 scram::{SCRAM_ITERATIONS, ScramAuth, gen_salted_password},
             },
         },
-        query::SimpleQueryHandler,
+        portal::{Format, Portal},
+        query::{ExtendedQueryHandler, SimpleQueryHandler},
         results::{FieldFormat, FieldInfo, QueryResponse, Response, Tag},
+        stmt::QueryParser,
         store::PortalStore,
     },
     error::{ErrorInfo, PgWireError, PgWireResult},
@@ -303,7 +305,7 @@ pub async fn serve(config: Config) -> Result<(), ServerError> {
     let listener = TcpListener::bind(config.postgres.listen).await?;
     let address = listener.local_addr()?;
     let handler = Arc::new(QueryHandler {
-        engine: engine::Engine::new(catalog.clone()),
+        engine: Arc::new(engine::Engine::new(catalog.clone())),
         catalog,
         typedb,
         state,
@@ -554,6 +556,12 @@ impl PgWireServerHandlers for Handlers {
         Arc::clone(&self.handler)
     }
 
+    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
+        Arc::new(ExtendedHandler {
+            handler: Arc::clone(&self.handler),
+        })
+    }
+
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
         let mut parameters = DefaultServerParameterProvider::default();
         parameters.server_version = "16.13".to_owned();
@@ -578,7 +586,71 @@ struct QueryHandler {
     state: StateStore,
     ddl_locks: DdlLocks,
     server_port: u16,
-    engine: engine::Engine,
+    engine: Arc<engine::Engine>,
+}
+
+/// PostgreSQL's extended query protocol (Parse/Bind/Describe/Execute), which
+/// JDBC clients such as Metabase use for every statement.
+struct ExtendedHandler {
+    handler: Arc<QueryHandler>,
+}
+
+#[async_trait]
+impl QueryParser for QueryHandler {
+    type Statement = engine::Prepared;
+
+    async fn parse_sql<C>(
+        &self,
+        client: &C,
+        sql: &str,
+        _types: &[Option<Type>],
+    ) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        self.engine.prepare(sql, &self.session(client)).await
+    }
+
+    fn get_parameter_types(&self, statement: &Self::Statement) -> PgWireResult<Vec<Type>> {
+        statement.parameter_types()
+    }
+
+    fn get_result_schema(
+        &self,
+        statement: &Self::Statement,
+        column_format: Option<&Format>,
+    ) -> PgWireResult<Vec<FieldInfo>> {
+        statement.result_fields(column_format)
+    }
+}
+
+#[async_trait]
+impl ExtendedQueryHandler for ExtendedHandler {
+    type Statement = engine::Prepared;
+    type QueryParser = QueryHandler;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        Arc::clone(&self.handler)
+    }
+
+    async fn do_query<C>(
+        &self,
+        client: &mut C,
+        portal: &Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if let engine::Prepared::ProjectionDdl(query) = &portal.statement.statement {
+            return Ok(self.handler.execute_projection_ddl(client, query).await);
+        }
+        let session = self.handler.session(client);
+        self.handler.engine.execute_prepared(portal, &session).await
+    }
 }
 
 type ProjectionKey = (String, String);
@@ -617,7 +689,13 @@ impl SimpleQueryHandler for QueryHandler {
             return Ok(vec![self.execute_projection_ddl(client, trimmed).await]);
         }
 
-        let session = SessionContext {
+        self.engine.execute(trimmed, &self.session(client)).await
+    }
+}
+
+impl QueryHandler {
+    fn session<C: ClientInfo>(&self, client: &C) -> SessionContext {
+        SessionContext {
             database: client
                 .metadata()
                 .get("database")
@@ -629,12 +707,9 @@ impl SimpleQueryHandler for QueryHandler {
                 .cloned()
                 .unwrap_or_else(|| "facet".to_owned()),
             server_port: self.server_port,
-        };
-        self.engine.execute(trimmed, &session).await
+        }
     }
-}
 
-impl QueryHandler {
     async fn refresh_all(&self) {
         let persisted = match self.state.load_all() {
             Ok(persisted) => persisted,

@@ -1228,6 +1228,16 @@ pub fn dbt_binary() -> TestResult<PathBuf> {
     Ok(PathBuf::from(required_env("FACET_E2E_DBT")?))
 }
 
+/// A Java 21+ runtime able to run the Metabase JAR.
+pub fn java_binary() -> TestResult<PathBuf> {
+    Ok(PathBuf::from(required_env("FACET_E2E_JAVA")?))
+}
+
+/// The open-source Metabase JAR.
+pub fn metabase_jar() -> TestResult<PathBuf> {
+    Ok(PathBuf::from(required_env("FACET_E2E_METABASE_JAR")?))
+}
+
 async fn run_typeql(
     client: &Client,
     origin: &str,
