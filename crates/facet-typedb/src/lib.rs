@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
 use chrono::{DateTime, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Timelike};
 use chrono_tz::Tz;
@@ -17,6 +17,7 @@ use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 #[derive(Clone, Debug)]
 pub struct TypeDbClient {
@@ -24,6 +25,7 @@ pub struct TypeDbClient {
     origin: String,
     username: String,
     password: String,
+    token: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Debug, Error)]
@@ -59,6 +61,7 @@ impl TypeDbClient {
             origin,
             username,
             password,
+            token: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -77,8 +80,14 @@ impl TypeDbClient {
             },
             "commit": false
         });
-        let token = self.sign_in().await?;
-        let (status, body) = self.post_query(&token, &request).await?;
+        let token = self.current_token().await?;
+        let (mut status, mut body) = self.post_query(&token, &request).await?;
+        if status == StatusCode::UNAUTHORIZED {
+            // TypeDB tokens expire server-side; an expired token is answered with 401
+            // and the session must authenticate again before resending the request.
+            let token = self.replace_token(&token).await?;
+            (status, body) = self.post_query(&token, &request).await?;
+        }
         if !status.is_success() {
             return Err(TypeDbError::Response { status, body });
         }
@@ -117,6 +126,27 @@ impl TypeDbClient {
         let status = response.status();
         let body = response.text().await?;
         Ok((status, body))
+    }
+
+    async fn current_token(&self) -> Result<String, TypeDbError> {
+        let mut cached = self.token.lock().await;
+        if let Some(token) = cached.as_ref() {
+            return Ok(token.clone());
+        }
+        let token = self.sign_in().await?;
+        *cached = Some(token.clone());
+        Ok(token)
+    }
+
+    async fn replace_token(&self, rejected: &str) -> Result<String, TypeDbError> {
+        let mut cached = self.token.lock().await;
+        if let Some(token) = cached.as_ref().filter(|token| token.as_str() != rejected) {
+            return Ok(token.clone());
+        }
+        *cached = None;
+        let token = self.sign_in().await?;
+        *cached = Some(token.clone());
+        Ok(token)
     }
 
     async fn sign_in(&self) -> Result<String, TypeDbError> {

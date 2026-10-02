@@ -16,6 +16,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex, Weak},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -24,7 +25,7 @@ use facet_core::{
     Catalog, CoreError, ProjectionStatement, QueryError, QueryResult, ScalarType, SessionContext,
     execute_sql, parse_projection_ddl,
 };
-use facet_state::StateStore;
+use facet_state::{PersistedProjection, StateStore};
 use facet_typedb::TypeDbClient;
 use futures::{Sink, stream};
 use pgwire::{
@@ -54,8 +55,8 @@ pub struct Config {
     typedb: TypeDbConfig,
     postgres: PostgresConfig,
     state: StateConfig,
-    #[serde(default, rename = "refresh")]
-    _refresh: Option<IgnoredRefreshConfig>,
+    #[serde(default)]
+    refresh: Option<RefreshConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -78,9 +79,30 @@ struct StateConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct IgnoredRefreshConfig {
-    #[serde(rename = "interval")]
-    _interval: Option<String>,
+struct RefreshConfig {
+    interval: Option<String>,
+}
+
+const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+fn parse_interval(input: &str) -> Result<Duration, ServerError> {
+    let invalid = || ServerError::InvalidRefreshInterval(input.to_owned());
+    let trimmed = input.trim();
+    let split = trimmed
+        .find(|character: char| !character.is_ascii_digit())
+        .ok_or_else(invalid)?;
+    let (number, unit) = trimmed.split_at(split);
+    let number: u64 = number.parse().map_err(|_| invalid())?;
+    let interval = match unit {
+        "ms" => Duration::from_millis(number),
+        "s" => Duration::from_secs(number),
+        "m" => Duration::from_secs(number.checked_mul(60).ok_or_else(invalid)?),
+        _ => return Err(invalid()),
+    };
+    if interval.is_zero() {
+        return Err(invalid());
+    }
+    Ok(interval)
 }
 
 #[derive(Debug, Error)]
@@ -97,6 +119,8 @@ pub enum ServerError {
     TypeDb(#[from] facet_typedb::TypeDbError),
     #[error("could not use Facet state: {0}")]
     State(#[from] facet_state::StateError),
+    #[error("invalid refresh interval {0:?}; expected a positive integer with ms, s or m")]
+    InvalidRefreshInterval(String),
 }
 
 impl Config {
@@ -106,11 +130,20 @@ impl Config {
         if !config.postgres.listen.ip().is_loopback() {
             return Err(ServerError::NonLoopback(config.postgres.listen));
         }
+        config.refresh_interval()?;
         Ok(config)
+    }
+
+    fn refresh_interval(&self) -> Result<Duration, ServerError> {
+        self.refresh
+            .as_ref()
+            .and_then(|refresh| refresh.interval.as_deref())
+            .map_or(Ok(DEFAULT_REFRESH_INTERVAL), parse_interval)
     }
 }
 
 pub async fn serve(config: Config) -> Result<(), ServerError> {
+    let refresh_interval = config.refresh_interval()?;
     let typedb_password = read_secret(&config.typedb.password_env)?;
     let postgres_password = read_secret(&config.postgres.password_env)?;
     let typedb = TypeDbClient::new(config.typedb.url, config.typedb.username, typedb_password)?;
@@ -131,6 +164,10 @@ pub async fn serve(config: Config) -> Result<(), ServerError> {
         ddl_locks: DdlLocks::default(),
         server_port: address.port(),
     });
+    tokio::spawn(refresh_projections(
+        Arc::downgrade(&handler),
+        refresh_interval,
+    ));
     let auth = Arc::new(FacetAuth::new(config.postgres.username, postgres_password));
     let handlers = Arc::new(Handlers { handler, auth });
 
@@ -156,6 +193,18 @@ pub async fn serve(config: Config) -> Result<(), ServerError> {
 
 fn read_secret(name: &str) -> Result<String, ServerError> {
     env::var(name).map_err(|_| ServerError::MissingSecret(name.to_owned()))
+}
+
+async fn refresh_projections(handler: Weak<QueryHandler>, interval: Duration) {
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let Some(handler) = handler.upgrade() else {
+            return;
+        };
+        handler.refresh_all().await;
+    }
 }
 
 #[derive(Debug)]
@@ -280,6 +329,53 @@ impl SimpleQueryHandler for QueryHandler {
 }
 
 impl QueryHandler {
+    async fn refresh_all(&self) {
+        let persisted = match self.state.load_all() {
+            Ok(persisted) => persisted,
+            Err(error) => {
+                eprintln!("Facet refresh could not load definitions: {error}");
+                return;
+            }
+        };
+        for projection in persisted {
+            self.refresh_one(projection).await;
+        }
+    }
+
+    async fn refresh_one(&self, projection: PersistedProjection) {
+        let database = projection.database.as_str();
+        let name = projection.definition.name().to_owned();
+        let ddl_lock = self.ddl_locks.for_projection(database, &name);
+        let _guard = ddl_lock.lock().await;
+        // DDL may have replaced or removed this generation while the lock was contended.
+        match self.state.load_all() {
+            Ok(current) => {
+                let unchanged = current.iter().any(|candidate| {
+                    candidate.database == projection.database
+                        && candidate.definition.name().eq_ignore_ascii_case(&name)
+                        && candidate.generation == projection.generation
+                });
+                if !unchanged {
+                    return;
+                }
+            }
+            Err(error) => {
+                eprintln!("Facet refresh could not recheck {database}.{name}: {error}");
+                return;
+            }
+        }
+        match self
+            .typedb
+            .materialize(database, &projection.definition)
+            .await
+        {
+            Ok(rows) => self.catalog.define(database, projection.definition, rows),
+            Err(error) => {
+                eprintln!("Facet refresh of {database}.{name} kept previous rows: {error}");
+            }
+        }
+    }
+
     async fn execute_projection_ddl<C>(&self, client: &C, query: &str) -> Response
     where
         C: ClientInfo,

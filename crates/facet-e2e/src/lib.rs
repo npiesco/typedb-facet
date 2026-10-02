@@ -448,14 +448,14 @@ interval = "{refresh_interval}"
         let stderr_capture = Arc::new(Mutex::new(String::new()));
         let stderr_thread_capture = Arc::clone(&stderr_capture);
 
-        thread::spawn(move || {
+        let mut stderr_reader = Some(thread::spawn(move || {
             let mut stderr = BufReader::new(stderr);
             let mut captured = String::new();
             let _ = stderr.read_to_string(&mut captured);
             if let Ok(mut destination) = stderr_thread_capture.lock() {
                 *destination = captured;
             }
-        });
+        }));
 
         let (ready_tx, ready_rx) = mpsc::channel();
         thread::spawn(move || {
@@ -479,6 +479,9 @@ interval = "{refresh_interval}"
             }
 
             if let Some(status) = child.child_mut().try_wait()? {
+                if let Some(reader) = stderr_reader.take() {
+                    let _ = reader.join();
+                }
                 let stderr = stderr_capture
                     .lock()
                     .map(|value| value.clone())
@@ -757,8 +760,12 @@ impl DelayedHttpProxy {
                     return;
                 }
                 let Ok(client) = incoming else { return };
+                accept_counters
+                    .accepted_connections
+                    .fetch_add(1, Ordering::AcqRel);
+                // An unreachable TypeDB closes this client connection; later clients still reach the proxy.
                 let Ok(upstream) = TcpStream::connect(target) else {
-                    return;
+                    continue;
                 };
                 let connection_gate = Arc::clone(&accept_gate);
                 let connection_counters = Arc::clone(&accept_counters);
@@ -804,6 +811,10 @@ impl DelayedHttpProxy {
     pub fn unauthorized_responses(&self) -> usize {
         self.counters.unauthorized_responses.load(Ordering::Acquire)
     }
+
+    pub fn accepted_connections(&self) -> usize {
+        self.counters.accepted_connections.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Default)]
@@ -811,6 +822,7 @@ struct HttpCounters {
     signin_requests: AtomicUsize,
     query_requests: AtomicUsize,
     unauthorized_responses: AtomicUsize,
+    accepted_connections: AtomicUsize,
 }
 
 impl Drop for DelayedHttpProxy {
