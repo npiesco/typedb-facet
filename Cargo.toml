@@ -26,8 +26,10 @@ facet-typedb = { path = "crates/facet-typedb" }
 futures = "0.3.32"
 pgwire = { version = "=0.40.7", default-features = false, features = ["server-api-ring"] }
 rand = "0.10.0"
+rcgen = "0.14.10"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 rusqlite = { version = "0.40.0", features = ["bundled"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
 rust_decimal = { version = "1.40.0", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"

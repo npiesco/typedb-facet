@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 facet-state.workspace = true
+rcgen.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

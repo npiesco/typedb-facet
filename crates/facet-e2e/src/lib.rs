@@ -384,6 +384,68 @@ impl Drop for TypeDbProcess {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct FacetOptions {
+    pub listen: String,
+    pub refresh_interval: String,
+    pub tls: Option<(PathBuf, PathBuf)>,
+}
+
+impl Default for FacetOptions {
+    fn default() -> Self {
+        Self {
+            listen: "127.0.0.1:0".to_owned(),
+            refresh_interval: "5s".to_owned(),
+            tls: None,
+        }
+    }
+}
+
+/// A freshly generated certificate authority and a server certificate it signed
+/// for `localhost` and `127.0.0.1`, written as PEM files.
+pub struct TlsMaterial {
+    pub ca_certificate: PathBuf,
+    pub server_certificate: PathBuf,
+    pub server_private_key: PathBuf,
+}
+
+impl TlsMaterial {
+    pub fn generate(directory: &Path, label: &str) -> TestResult<Self> {
+        let ca_key = rcgen::KeyPair::generate()?;
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new())?;
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, format!("Facet E2E {label} CA"));
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca_certificate = ca_params.self_signed(&ca_key)?;
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+        let server_key = rcgen::KeyPair::generate()?;
+        let mut server_params =
+            rcgen::CertificateParams::new(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])?;
+        server_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "localhost");
+        server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let server_certificate = server_params.signed_by(&server_key, &issuer)?;
+
+        let material = Self {
+            ca_certificate: directory.join(format!("{label}-ca.crt")),
+            server_certificate: directory.join(format!("{label}-server.crt")),
+            server_private_key: directory.join(format!("{label}-server.key")),
+        };
+        std::fs::write(&material.ca_certificate, ca_certificate.pem())?;
+        std::fs::write(&material.server_certificate, server_certificate.pem())?;
+        std::fs::write(&material.server_private_key, server_key.serialize_pem())?;
+        Ok(material)
+    }
+}
+
 pub struct FacetProcess {
     child: Child,
     _stderr: Arc<Mutex<String>>,
@@ -401,8 +463,38 @@ impl FacetProcess {
         workspace: &Path,
         refresh_interval: &str,
     ) -> TestResult<Self> {
+        Self::start_with_options(
+            binary,
+            typedb_origin,
+            workspace,
+            &FacetOptions {
+                refresh_interval: refresh_interval.to_owned(),
+                ..FacetOptions::default()
+            },
+        )
+    }
+
+    pub fn start_with_options(
+        binary: &Path,
+        typedb_origin: &str,
+        workspace: &Path,
+        options: &FacetOptions,
+    ) -> TestResult<Self> {
         let config_path = workspace.join("facet.toml");
         let state_path = toml_string(&workspace.join("facet-state.sqlite3"));
+        let listen = &options.listen;
+        let refresh_interval = &options.refresh_interval;
+        let tls = options
+            .tls
+            .as_ref()
+            .map(|(certificate, key)| {
+                format!(
+                    "\n[postgres.tls]\ncertificate_path = \"{}\"\nprivate_key_path = \"{}\"\n",
+                    toml_string(certificate),
+                    toml_string(key)
+                )
+            })
+            .unwrap_or_default();
         let config = format!(
             r#"[typedb]
 url = "{typedb_origin}"
@@ -410,10 +502,10 @@ username = "{TYPEDB_USER}"
 password_env = "FACET_TYPEDB_PASSWORD"
 
 [postgres]
-listen = "127.0.0.1:0"
+listen = "{listen}"
 username = "{FACET_USER}"
 password_env = "FACET_PG_PASSWORD"
-
+{tls}
 [state]
 path = "{state_path}"
 
@@ -906,7 +998,19 @@ impl ResponseGate {
 }
 
 pub fn run_psql(psql: &OsStr, target: &PgTarget, sql: &str) -> TestResult<Output> {
-    Ok(Command::new(psql)
+    run_psql_env(psql, target, sql, &[])
+}
+
+/// Runs psql like [`run_psql`], with extra libpq environment variables that
+/// override the defaults (for example `PGSSLMODE` and `PGSSLROOTCERT`).
+pub fn run_psql_env(
+    psql: &OsStr,
+    target: &PgTarget,
+    sql: &str,
+    environment: &[(&str, &OsStr)],
+) -> TestResult<Output> {
+    let mut command = Command::new(psql);
+    command
         .arg("--no-psqlrc")
         .arg("--host")
         .arg(target.address.ip().to_string())
@@ -926,8 +1030,11 @@ pub fn run_psql(psql: &OsStr, target: &PgTarget, sql: &str) -> TestResult<Output
         .arg(sql)
         .env("PGPASSWORD", &target.password)
         .env("PGSSLMODE", "disable")
-        .env("PGCONNECT_TIMEOUT", "5")
-        .output()?)
+        .env("PGCONNECT_TIMEOUT", "5");
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    Ok(command.output()?)
 }
 
 pub fn assert_psql_success(output: &Output, operation: &str) {

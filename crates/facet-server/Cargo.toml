@@ -23,6 +23,7 @@ facet-typedb.workspace = true
 futures.workspace = true
 pgwire.workspace = true
 rand.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

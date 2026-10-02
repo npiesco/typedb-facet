@@ -4,7 +4,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! Loopback PostgreSQL-wire server for Facet.
+//! PostgreSQL-wire server for Facet. Listeners off loopback require TLS and
+//! SCRAM-SHA-256.
 
 #![forbid(unsafe_code)]
 
@@ -43,9 +44,13 @@ use pgwire::{
         store::PortalStore,
     },
     error::{ErrorInfo, PgWireError, PgWireResult},
-    messages::{PgWireBackendMessage, data::DataRow},
-    tokio::process_socket,
+    messages::{PgWireBackendMessage, PgWireFrontendMessage, data::DataRow},
+    tokio::{
+        TlsAcceptor, process_socket,
+        tokio_rustls::rustls::{ServerConfig, crypto::ring::default_provider},
+    },
 };
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::{net::TcpListener, sync::Mutex as AsyncMutex};
@@ -71,6 +76,45 @@ struct PostgresConfig {
     listen: SocketAddr,
     username: String,
     password_env: String,
+    #[serde(default)]
+    tls: Option<TlsConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TlsConfig {
+    certificate_path: PathBuf,
+    private_key_path: PathBuf,
+}
+
+impl TlsConfig {
+    fn acceptor(&self) -> Result<TlsAcceptor, ServerError> {
+        let certificate_error = |detail: String| ServerError::TlsCertificate {
+            path: self.certificate_path.clone(),
+            detail,
+        };
+        let certificates = CertificateDer::pem_file_iter(&self.certificate_path)
+            .map_err(|error| certificate_error(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| certificate_error(error.to_string()))?;
+        if certificates.is_empty() {
+            return Err(certificate_error("no PEM certificates found".to_owned()));
+        }
+        let private_key =
+            PrivateKeyDer::from_pem_file(&self.private_key_path).map_err(|error| {
+                ServerError::TlsPrivateKey {
+                    path: self.private_key_path.clone(),
+                    detail: error.to_string(),
+                }
+            })?;
+        let mut config = ServerConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|error| ServerError::TlsConfig(error.to_string()))?
+            .with_no_client_auth()
+            .with_single_cert(certificates, private_key)
+            .map_err(|error| ServerError::TlsConfig(error.to_string()))?;
+        config.alpn_protocols = vec![b"postgresql".to_vec()];
+        Ok(TlsAcceptor::from(Arc::new(config)))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -111,8 +155,16 @@ pub enum ServerError {
     ReadConfig(#[from] io::Error),
     #[error("could not parse Facet config: {0}")]
     ParseConfig(#[from] toml::de::Error),
-    #[error("Facet Stage 1 only permits loopback PostgreSQL listeners, got {0}")]
-    NonLoopback(SocketAddr),
+    #[error(
+        "non-loopback PostgreSQL listener {0} requires [postgres.tls]; Facet serves off loopback only over TLS with SCRAM-SHA-256"
+    )]
+    TlsRequired(SocketAddr),
+    #[error("could not load TLS certificate {path}: {detail}")]
+    TlsCertificate { path: PathBuf, detail: String },
+    #[error("could not load TLS private key {path}: {detail}")]
+    TlsPrivateKey { path: PathBuf, detail: String },
+    #[error("invalid TLS configuration: {0}")]
+    TlsConfig(String),
     #[error("required secret environment variable {0} is not set")]
     MissingSecret(String),
     #[error("could not initialize TypeDB HTTP client: {0}")]
@@ -127,8 +179,8 @@ impl Config {
     pub fn from_path(path: &Path) -> Result<Self, ServerError> {
         let input = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&input)?;
-        if !config.postgres.listen.ip().is_loopback() {
-            return Err(ServerError::NonLoopback(config.postgres.listen));
+        if !config.postgres.listen.ip().is_loopback() && config.postgres.tls.is_none() {
+            return Err(ServerError::TlsRequired(config.postgres.listen));
         }
         config.refresh_interval()?;
         Ok(config)
@@ -146,6 +198,12 @@ pub async fn serve(config: Config) -> Result<(), ServerError> {
     let refresh_interval = config.refresh_interval()?;
     let typedb_password = read_secret(&config.typedb.password_env)?;
     let postgres_password = read_secret(&config.postgres.password_env)?;
+    let tls_acceptor = config
+        .postgres
+        .tls
+        .as_ref()
+        .map(TlsConfig::acceptor)
+        .transpose()?;
     let typedb = TypeDbClient::new(config.typedb.url, config.typedb.username, typedb_password)?;
     let state = StateStore::open(config.state.path)?;
     let catalog = Catalog::default();
@@ -169,7 +227,11 @@ pub async fn serve(config: Config) -> Result<(), ServerError> {
         refresh_interval,
     ));
     let auth = Arc::new(FacetAuth::new(config.postgres.username, postgres_password));
-    let handlers = Arc::new(Handlers { handler, auth });
+    let handlers = Arc::new(Handlers {
+        handler,
+        auth,
+        require_tls: tls_acceptor.is_some(),
+    });
 
     println!(
         "{}",
@@ -183,8 +245,9 @@ pub async fn serve(config: Config) -> Result<(), ServerError> {
     loop {
         let (socket, _) = listener.accept().await?;
         let handlers = Arc::clone(&handlers);
+        let tls_acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
-            if let Err(error) = process_socket(socket, None, handlers).await {
+            if let Err(error) = process_socket(socket, tls_acceptor, handlers).await {
                 eprintln!("Facet pgwire connection failed: {error}");
             }
         });
@@ -243,6 +306,47 @@ impl AuthSource for FacetAuth {
 struct Handlers {
     handler: Arc<QueryHandler>,
     auth: Arc<FacetAuth>,
+    require_tls: bool,
+}
+
+/// Refuses any startup that did not negotiate TLS when the listener has TLS
+/// configured, then delegates to SCRAM-SHA-256 authentication. libpq sends an
+/// empty SCRAM username, so authentication failures name the startup user.
+struct RequireTls<H> {
+    inner: H,
+    required: bool,
+}
+
+#[async_trait]
+impl<H: StartupHandler> StartupHandler for RequireTls<H> {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if self.required && !client.is_secure() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_owned(),
+                "28000".to_owned(),
+                "Facet requires TLS on this listener; reconnect with sslmode=require or stricter"
+                    .to_owned(),
+            ))));
+        }
+        match self.inner.on_startup(client, message).await {
+            Err(PgWireError::InvalidPassword(_)) => Err(PgWireError::InvalidPassword(
+                LoginInfo::from_client_info(client)
+                    .user()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )),
+            result => result,
+        }
+    }
 }
 
 impl PgWireServerHandlers for Handlers {
@@ -260,7 +364,10 @@ impl PgWireServerHandlers for Handlers {
         parameters.client_encoding = Some("UTF8".to_owned());
         let mut scram = ScramAuth::new(self.auth.clone());
         scram.set_iterations(SCRAM_ITERATIONS);
-        Arc::new(SASLAuthStartupHandler::new(Arc::new(parameters)).with_scram(scram))
+        Arc::new(RequireTls {
+            inner: SASLAuthStartupHandler::new(Arc::new(parameters)).with_scram(scram),
+            required: self.require_tls,
+        })
     }
 }
 
